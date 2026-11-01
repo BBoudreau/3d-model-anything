@@ -32,6 +32,8 @@ export function collectInventory(room: BuiltRoom) {
     };
     const object = copy(source);
     source.matrixWorld.decompose(object.position, object.quaternion, object.scale);
+    // Opt-in for pieces displayed leaning or propped: knoll them in their own rest frame instead.
+    if (source.userData.knollRestPose) object.quaternion.identity();
     object.visible = true;
     object.updateMatrixWorld(true);
     const bounds = new THREE.Box3().setFromObject(object);
@@ -43,6 +45,46 @@ export function collectInventory(room: BuiltRoom) {
     items.push({ name: label(source.name), object, size, origin: bounds.getCenter(new THREE.Vector3()), source });
   }
   inventory.set(room, items.sort((a, b) => Math.max(b.size.x,b.size.z) * Math.max(b.size.y,b.size.z) - Math.max(a.size.x,a.size.z) * Math.max(a.size.y,a.size.z)));
+}
+
+/**
+ * Opt-in grouping: when a room tags pieces with `userData.knollGroup` (and optionally a numeric
+ * `userData.knollGroupOrder`), each group is packed on its own and the groups are laid out in rows
+ * under a floor label. Rooms without tags get the single MaxRects pack exactly as before.
+ */
+function groupedPack(items: Item[], rects: {width:number;height:number}[], gap: number) {
+  const keys=items.map(i=>i.source.userData.knollGroup as string|undefined);
+  if(!keys.some(Boolean))return {...packObjects(rects,gap),labels:[] as {text:string;x:number;y:number;size:number}[]};
+  const order=new Map<string,number>();
+  items.forEach((item,i)=>{const k=keys[i]??'Other',o=item.source.userData.knollGroupOrder??1e9;order.set(k,Math.min(order.get(k)??1e9,o));});
+  const blocks=[...order.keys()].sort((a,b)=>order.get(a)!-order.get(b)!||a.localeCompare(b)).map(key=>{
+    const index=keys.map((k,i)=>(k??'Other')===key?i:-1).filter(i=>i>=0);
+    // Lay long pieces (conduit runs, rods) along the group's strip rather than letting them set its height.
+    const long=Math.max(...index.map(i=>Math.max(rects[i].width,rects[i].height)))+gap;
+    return {key,index,pack:packObjects(index.map(i=>rects[i]),gap,long),x:0,y:0};
+  });
+  const G=.45,L=.4,size=.27;
+  const total=blocks.reduce((s,b)=>s+(b.pack.width+G)*(b.pack.height+L+G),0);
+  const rowWidth=Math.max(Math.sqrt(total*1.6),...blocks.map(b=>b.pack.width));
+  let x=0,y=0,rowHeight=0,width=0;
+  for(const b of blocks){
+    if(x>0&&x+b.pack.width>rowWidth){x=0;y+=rowHeight+G;rowHeight=0;}
+    b.x=x;b.y=y+L;x+=b.pack.width+G;rowHeight=Math.max(rowHeight,b.pack.height+L);width=Math.max(width,x-G);
+  }
+  const placements=blocks.flatMap(b=>b.pack.placements.map(p=>({...p,index:b.index[p.index],x:p.x+b.x,y:p.y+b.y})));
+  const labels=blocks.map(b=>({text:`${b.key} · ${b.index.length}`,x:b.x,y:b.y-L/2,size}));
+  return {placements,width,height:y+rowHeight,labels};
+}
+/** Flat floor caption, left-aligned at (x, z), `size` m tall. */
+function groupLabel(text: string, x: number, z: number, size: number) {
+  const canvas=document.createElement('canvas'),ctx=canvas.getContext('2d')!;const px=96;
+  ctx.font=`600 ${px}px system-ui, sans-serif`;canvas.width=Math.ceil(ctx.measureText(text).width)+16;canvas.height=Math.ceil(px*1.3);
+  ctx.font=`600 ${px}px system-ui, sans-serif`;ctx.fillStyle='#3c372e';ctx.textBaseline='middle';ctx.fillText(text,8,canvas.height/2);
+  const map=new THREE.CanvasTexture(canvas);map.colorSpace=THREE.SRGBColorSpace;map.anisotropy=8;
+  const w=size*canvas.width/canvas.height;
+  const label=new THREE.Mesh(new THREE.PlaneGeometry(w,size),new THREE.MeshBasicMaterial({map,transparent:true,toneMapped:false}));
+  label.name='knoll-group-label';label.rotation.x=-Math.PI/2;label.position.set(x+w/2,.002,z);label.renderOrder=1;
+  return label as THREE.Mesh<THREE.PlaneGeometry,THREE.MeshBasicMaterial>;
 }
 
 /** Shared arrangement for the interactive view and deterministic animations. */
@@ -93,10 +135,12 @@ export function createKnollingLayout(room: BuiltRoom) {
     objects.add(orient);return {orient,size,object};
   });
   const gap=.065;
-  const packed=packObjects(laidOut.map(({size})=>({width:size.x,height:size.z})),gap);
+  const packed=groupedPack(items,laidOut.map(({size})=>({width:size.x,height:size.z})),gap);
   for(const p of packed.placements){const {orient}=laidOut[p.index];if(p.rotated)orient.rotation.y=Math.PI/2;orient.position.set(p.x+(p.width-gap)/2-packed.width/2,0,p.y+(p.height-gap)/2-packed.height/2);}
+  const labelResources:{dispose():void}[]=[];
+  for(const l of packed.labels){const label=groupLabel(l.text,l.x-packed.width/2,l.y-packed.height/2,l.size);labelResources.push(label.material,label.material.map!);objects.add(label);}
   objects.updateMatrixWorld(true);
-  return {objects,items,laidOut,packed,originalGeometries};
+  return {objects,items,laidOut,packed,originalGeometries,labelResources};
 }
 
 let cleanup: (()=>void) | undefined;
@@ -120,7 +164,7 @@ export async function showKnolling(host: HTMLElement, room: BuiltRoom, title: st
   const environment=pmrem.fromScene(studio,.08);scene.environment=environment.texture;scene.environmentIntensity=.3;
   studio.dispose();pmrem.dispose();
   scene.add(new THREE.HemisphereLight('#fffaf0','#a59b85',2));
-  const {objects,packed,originalGeometries}=createKnollingLayout(room);
+  const {objects,packed,originalGeometries,labelResources}=createKnollingLayout(room);
   scene.add(objects);
   batchStatic(objects,[],{mergeDynamic:true});
   const floorMaterial=new THREE.MeshStandardMaterial({color:'#d7d0c1',roughness:1});
@@ -136,10 +180,17 @@ export async function showKnolling(host: HTMLElement, room: BuiltRoom, title: st
   controls.screenSpacePanning=true;controls.mouseButtons.LEFT=THREE.MOUSE.ROTATE;controls.mouseButtons.RIGHT=THREE.MOUSE.PAN;controls.minZoom=.5;controls.maxZoom=18;
   let pending=0,disposed=false;
   const render=()=>{if(disposed||pending)return;pending=requestAnimationFrame(()=>{pending=0;renderer.render(scene,camera);renderer.shadowMap.autoUpdate=false;host.dataset.ready='1';});};
-  const fit=()=>{const aspect=host.clientWidth/host.clientHeight;const height=Math.max(packed.height+1.4,(packed.width+1)/aspect);camera.left=-height*aspect/2;camera.right=height*aspect/2;camera.top=height/2;camera.bottom=-height/2;camera.zoom=1;camera.position.set(0,30,.001);controls.target.set(0,0,0);camera.updateProjectionMatrix();controls.update();render();};
+  // Fit the arrangement into the area below the caption header (it overlays the canvas), not the whole canvas.
+  const fit=()=>{
+    const W=host.clientWidth,H=host.clientHeight,aspect=W/H;
+    const header=Math.min(H*.4,Math.max(0,caption.getBoundingClientRect().bottom-host.getBoundingClientRect().top+8));
+    const perPx=Math.max((packed.height+1)/(H-header),(packed.width+1)/W),height=perPx*H,shift=-header/2*perPx;
+    camera.left=-height*aspect/2;camera.right=height*aspect/2;camera.top=height/2;camera.bottom=-height/2;camera.zoom=1;
+    camera.position.set(0,30,shift+.001);controls.target.set(0,0,shift);camera.updateProjectionMatrix();controls.update();render();
+  };
   const resize=()=>{renderer.setSize(host.clientWidth,host.clientHeight);fit();};
   const observer=new ResizeObserver(resize);observer.observe(host);
   controls.addEventListener('change',render);fitButton.addEventListener('click',fit);renderer.domElement.addEventListener('dblclick',fit);
   host.dataset.ready='0';host.dataset.items=String(items.length);resize();
-  cleanup=()=>{disposed=true;cancelAnimationFrame(pending);observer.disconnect();controls.dispose();environment.dispose();light.shadow.dispose();floorGeometry.dispose();floorMaterial.dispose();objects.traverse(o=>{if(o instanceof THREE.Mesh&&!originalGeometries.has(o.geometry))o.geometry.dispose();});renderer.dispose();renderer.forceContextLoss();};
+  cleanup=()=>{disposed=true;cancelAnimationFrame(pending);observer.disconnect();controls.dispose();environment.dispose();light.shadow.dispose();floorGeometry.dispose();floorMaterial.dispose();objects.traverse(o=>{if(o instanceof THREE.Mesh&&!originalGeometries.has(o.geometry))o.geometry.dispose();});for(const r of labelResources)r.dispose();renderer.dispose();renderer.forceContextLoss();};
 }
