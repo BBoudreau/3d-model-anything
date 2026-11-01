@@ -15,3 +15,10 @@ data/scans/
 apps/house-capture/release/screenshots/
 
 HouseCapture.xcodeproj/
+
+# personal room scans and their rebuilds (never commit or publish)
+.venv-scan/
+data/web-assets/
+data/renders/
+demos/lobby/
+data/demos/lobby/
