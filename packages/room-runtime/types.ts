@@ -3,6 +3,10 @@ import type { WallDef } from './walls';
 
 export type V3 = [number, number, number];
 
+/** What the playground hands to `BuiltRoom.playExtras` (typed loosely so the runtime doesn't depend on the viewer). */
+export interface PlayContext { physics: unknown; scene: THREE.Scene; hockey: unknown; glass: unknown }
+export interface PlayExtras { update(dt: number): boolean; reset(): void }
+
 /** A rebuilt room, ready to drop into the viewer (or the capture page) */
 export interface BuiltRoom {
   layout?: RoomLayout;
@@ -45,6 +49,14 @@ export interface BuiltRoom {
    * bodies; without it they stay separate objects (safe after building physics colliders).
    */
   optimize?(opts?: { static?: boolean }): { meshesBefore: number; meshesAfter: number; batches: number } | void;
+  /** Playground only: tag which pieces move (`userData.physics`) before batching and physics. */
+  preparePlay?(): void;
+  /**
+   * Playground only: room-specific extras that need the running play scene (scripted targets, swapped
+   * textures...). Called once after physics, hockey and glass exist; `update` runs every frame (return
+   * true to redraw), `reset` runs on Reset objects. The context is the playground's own objects.
+   */
+  playExtras?(ctx: PlayContext): PlayExtras | undefined | Promise<PlayExtras | undefined>;
   /** posed reference photos (House Capture bundles), in room coordinates */
   photos?: PhotoPose[];
 }

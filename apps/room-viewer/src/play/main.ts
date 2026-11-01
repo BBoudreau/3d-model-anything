@@ -8,6 +8,8 @@ import { loadRapier, Physics } from '../../../../packages/room-physics/physics';
 import { Impacts } from '../../../../packages/room-physics/audio';
 import { Slingshot } from './slingshot';
 import { FirstPerson } from './first-person';
+import { Hockey } from './hockey';
+import { Glass } from './glass';
 import { DynamicShadows } from '../../../../packages/room-runtime/dynamic-shadows';
 
 const q = new URLSearchParams(location.search);
@@ -53,6 +55,8 @@ if (roomId === 'office-v4') {
   const { makeOfficeContentsThrowable } = await import('../../../../demos/office-v4/play-physics');
   makeOfficeContentsThrowable(room);
 }
+// Room-specific play tags (which pieces move), applied before batching.
+room.preparePlay?.();
 if (!q.has('nobatch')) room.optimize?.();
 progress('Preparing room lighting…', .45);
 await precompileRoomRendering(renderer, scene, room, camera);
@@ -115,6 +119,54 @@ const fpv = new FirstPerson(canvas, physics, camera, walkStart, new THREE.Vector
   thrown: thing => { throws++; launched.add(thing.body.handle); roundStarted = true; score(); },
   error: message => { pause(); document.querySelector('#lock-error')!.textContent = message; },
 });
+const hockey = new Hockey(physics, camera, scene, room, () => fpv.active ? 'fpv' : 'playground', () => fpv.player.collider);
+hockey.onShot = puck => { throws++; launched.add(puck.body.handle); roundStarted = true; score(); };
+// Breakable panes (rooms tag them in preparePlay); a shattered pane scores once, its shards don't.
+const glass = new Glass(physics, scene, room, hockey);
+glass.onShatter = (pane, shards) => {
+  knocked.add(-1 - pane.id);
+  for (const s of shards) launched.add(s.body.handle);
+  roundStarted = true;
+  score();
+  sound.hit(`pane-${pane.id}`, 'glass', 1, .6);
+  dirty = true;
+};
+// Room extras that need the running play scene (the room module supplies them, if any).
+const fun = await room.playExtras?.({ physics, scene, hockey, glass });
+const hockeyButton = document.querySelector<HTMLButtonElement>('#hockey-toggle')!;
+function setHockey(on: boolean) {
+  cancelAim();
+  hockey.setEnabled(on);
+  hockeyButton.setAttribute('aria-pressed', String(on));
+  document.body.classList.toggle('hockey', on);
+  const url = new URL(location.href);
+  if (on) url.searchParams.set('hockey', '1'); else url.searchParams.delete('hockey');
+  history.replaceState(null, '', url);
+  dirty = true;
+}
+hockeyButton.addEventListener('click', () => { setHockey(!hockey.enabled); canvas.focus({ preventScroll: true }); });
+window.addEventListener('keydown', event => {
+  if (event.code !== 'KeyH' || event.repeat || event.metaKey || event.ctrlKey || event.altKey || !playing) return;
+  if (event.target instanceof HTMLElement && event.target.matches('select, input, textarea')) return;
+  setHockey(!hockey.enabled);
+});
+function setHockeyCursor(event: { clientX: number; clientY: number }) {
+  const rect = canvas.getBoundingClientRect();
+  hockey.cursor.set((event.clientX - rect.left) / rect.width * 2 - 1, 1 - (event.clientY - rect.top) / rect.height * 2);
+}
+// First person: with the stick out, left click shoots instead of grabbing (runs before FirstPerson's handler).
+window.addEventListener('mousedown', event => {
+  if (!fpv.active || !fpv.running || !hockey.enabled || event.button !== 0 || fpv.hands.held) return;
+  event.preventDefault(); event.stopPropagation();
+  hockey.windup();
+}, true);
+window.addEventListener('mouseup', event => {
+  if (!fpv.active || !hockey.winding || event.button !== 0) return;
+  let ndc: THREE.Vector2 | undefined;
+  if (fpv.freeCursor) { setHockeyCursor(event); ndc = hockey.cursor; }
+  hockey.shoot(ndc);
+  dirty = true;
+}, true);
 function setView(firstPerson: boolean) {
   cancelCameraDrag(); cancelAim();
   fpv.setActive(firstPerson);
@@ -224,6 +276,9 @@ function reset() {
   cancelCameraDrag();
   cancelAim();
   fpv.hands.clear();
+  hockey.clear();
+  glass.reset();
+  fun?.reset();
   physics.resetAll();
   if (fpv.active) fpv.respawn();
   throws = 0;
@@ -266,6 +321,13 @@ canvas.addEventListener('pointerdown', event => {
   event.preventDefault();
   canvas.focus({ preventScroll: true });
   sound.unlock();
+  if (hockey.enabled) {
+    setHockeyCursor(event);
+    canvas.setPointerCapture(event.pointerId);
+    hockey.windup();
+    dirty = true;
+    return;
+  }
   aim(event);
   if (sling.begin()) {
     const thing = sling.release();
@@ -285,6 +347,7 @@ canvas.addEventListener('pointermove', event => {
     return;
   }
   if (!playing) return;
+  if (hockey.enabled && tool === 'throw') { setHockeyCursor(event); dirty = true; return; }
   if (tool === 'throw') {
     pendingAim = { clientX: event.clientX, clientY: event.clientY };
     dirty = true;
@@ -293,6 +356,12 @@ canvas.addEventListener('pointermove', event => {
 canvas.addEventListener('pointerup', event => {
   if (fpv.active) return;
   if (event.pointerId === cameraPointer?.id) { cancelCameraDrag(); return; }
+  if (hockey.winding && event.button === 0) {
+    setHockeyCursor(event);
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    hockey.shoot();
+    dirty = true;
+  }
 });
 canvas.addEventListener('pointercancel', event => { cancelAim(); if (event.pointerId === cameraPointer?.id) cancelCameraDrag(); });
 canvas.addEventListener('lostpointercapture', event => { if (event.pointerId === cameraPointer?.id) cancelCameraDrag(); });
@@ -391,6 +460,7 @@ const timer = new THREE.Timer();
 loader.classList.add('done');
 toolbar.hidden = interaction.hidden = false;
 setView(q.get('mode') !== 'playground');
+if (q.get('hockey') === '1') setHockey(true);
 statsEl.hidden = q.get('stats') !== '1';
 renderer.setAnimationLoop(time => {
   timer.update(time);
@@ -402,6 +472,8 @@ renderer.setAnimationLoop(time => {
   physMs += (performance.now() - before - physMs) * .05;
   wasMoving = moving > 0;
   if (fpv.active && fpv.update()) dirty = true;
+  if (hockey.update(dt)) dirty = true;
+  if (fun?.update(dt)) dirty = true;
   if (pendingAim && playing) {
     aim(pendingAim);
     canvas.classList.toggle('grabbable', !!sling.hovered);
@@ -416,13 +488,15 @@ renderer.setAnimationLoop(time => {
   if (roundStarted && playing && moving) {
     const beforeScore = knocked.size;
     for (const thing of physics.things) {
-      if (launched.has(thing.body.handle) || knocked.has(thing.body.handle)) continue;
+      if (launched.has(thing.body.handle) || knocked.has(thing.body.handle) || thing.obj.userData.noScore) continue;
       // A meaningful displacement or tip counts once per round; selected projectiles don't.
       if (thing.curr.p.distanceTo(thing.home.p) > .25 || thing.curr.q.angleTo(thing.home.q) > .6) knocked.add(thing.body.handle);
     }
     if (knocked.size !== beforeScore) score();
   }
-  const hint = fpv.active ? fpv.freeCursor ? (fpv.hands.held ? 'Click: throw · E: drop · Right-drag: look · Scroll: hold distance' : 'Click an object nearby: throw · E: carry / drop · Right-drag: look · WASD: move · Esc: pause') : (fpv.hands.held ? 'Left click: throw · E / right click: drop · Scroll: hold distance' : 'WASD: move · Shift: sprint · Space: jump · C: crouch · Click: throw · E: carry / drop · Esc: pause') : sling.selected ? 'Click to throw'
+  const hockeyHint = fpv.active ? 'Click: shoot a puck · Hold: wind up a slap shot · WASD: move · H: put the stick away · R: respawn · Esc: pause'
+    : 'Click: shoot a puck at the cursor · Hold: wind up a slap shot · H: put the stick away · R: reset · Alt-drag: orbit · Right-drag: pan';
+  const hint = hockey.enabled && (!fpv.active || (fpv.running && !fpv.hands.held)) ? hockeyHint : fpv.active ? fpv.freeCursor ? (fpv.hands.held ? 'Click: throw · E: drop · Right-drag: look · Scroll: hold distance' : 'Click an object nearby: throw · E: carry / drop · Right-drag: look · WASD: move · Esc: pause') : (fpv.hands.held ? 'Left click: throw · E / right click: drop · Scroll: hold distance' : 'WASD: move · Shift: sprint · Space: jump · C: crouch · Click: throw · E: carry / drop · Esc: pause') : sling.selected ? 'Click to throw'
     : sling.hovered ? 'Click to throw this object' : tool === 'throw' ? 'Click an object to throw · Alt-drag to orbit · Right-drag to pan · Scroll to zoom' : `Drag to ${tool} · Scroll / pinch to zoom · Home to reset view`;
   if (lastHint !== hint) { actionHint.textContent = hint; lastHint = hint; }
   const name = (fpv.active ? fpv.hands.held ?? fpv.hands.hovered : sling.selected ?? sling.hovered)?.name.replaceAll('-', ' ') ?? '';
@@ -448,8 +522,8 @@ renderer.setAnimationLoop(time => {
 
 // Inspection API for physics checks and repeatable input tests.
 Object.assign(window, { __play: {
-  ready: true, room: roomId, physics, sling, shadows, fpv, camera, renderer, scene,
-  setView,
+  ready: true, room: roomId, physics, sling, shadows, fpv, camera, renderer, scene, hockey, glass, fun,
+  setView, setHockey,
   get input() { return playing ? 'play' : 'menu'; },
   get effects() { return pipeline.ao; },
   get score() { return { throws, knocked: knocked.size }; },

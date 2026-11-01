@@ -65,7 +65,7 @@ export class Slingshot {
     const hit = this.hits[0];
     if (hit) for (let o: THREE.Object3D | null = hit.object; o; o = o.parent) {
       const thing = this.objects.get(o);
-      if (thing) { this.hovered = thing; break; }
+      if (thing) { if (!this.physics.isHeld(thing)) this.hovered = thing; break; }
     }
   }
 

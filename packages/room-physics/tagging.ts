@@ -22,6 +22,26 @@ export interface PhysicsTag {
   wakeOnImpact?: boolean;
   /** False for independently mounted objects, which do not rest on nearby props. */
   wakeOnSupportLoss?: boolean;
+  /** m/s: a frozen piece only detaches when struck at least this fast (e.g. sign letters held in grooves). */
+  breakSpeed?: number;
+  /** m/s: on detaching, push the piece out along its local +z (off the board it hangs on) with a little spin. */
+  detachKick?: number;
+  /**
+   * Breakable pane (playground): at `breakSpeed` it shatters into shards instead of detaching whole.
+   * releases: frees every piece `heldBy` this id; backstop: a shards-only stop behind the pane (recessed wall glass);
+   * out: shards start this far toward the room (m), clear of the sill / transom bar the pane stands on.
+   */
+  shatter?: {
+    thickness?: number; releases?: string; backstop?: boolean; out?: number;
+    /** panes sharing a group break together (the four walls of a candy hopper) */
+    group?: string;
+    /** keep at most this many (largest) pieces */
+    maxPieces?: number;
+    /** while intact, a solid collider for everything (not just pucks): things leaning on the glass */
+    solid?: boolean;
+  };
+  /** Held in place (e.g. behind case glass): stays fixed, ungrabbable and unhittable until Physics.release(id). */
+  heldBy?: string;
   /** kg (dynamic only); estimated from the volume when missing */
   mass?: number;
   shape?: ShapeKind;

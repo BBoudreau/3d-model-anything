@@ -628,8 +628,9 @@ export class Physics {
       if (speed >= .6) this.pendingImpacts.set(key, this.stepsTaken + 3);
       // Overlapping home colliders and resting contact are not a new strike.
       if (speed < .35) return;
-      if (a?.frozen && a.wakeOnImpact && b && !b.frozen) this.unfreeze(a);
-      else if (b?.frozen && b.wakeOnImpact && a && !a.frozen) this.unfreeze(b);
+      const breaks = (t: DynamicThing) => speed >= (physicsTag(t.obj)?.breakSpeed ?? 0);
+      if (a?.frozen && a.wakeOnImpact && b && !b.frozen && breaks(a)) this.unfreeze(a);
+      else if (b?.frozen && b.wakeOnImpact && a && !a.frozen && breaks(b)) this.unfreeze(b);
     });
     this.events.drainContactForceEvents(e => {
       const key = this.pairKey(e.collider1(), e.collider2());
@@ -667,16 +668,50 @@ export class Physics {
 
   /** Move this object and any loose items resting on top, never adjoining furniture. */
   unfreeze(t: DynamicThing | undefined) {
-    if (!t?.frozen) return;
+    if (!t?.frozen || this.isHeld(t)) return;
     t.frozen = false;
     t.body.setBodyType(this.R.RigidBodyType.Dynamic, true);
+    const kick = physicsTag(t.obj)?.detachKick;
+    if (kick) {
+      // Clear the lip it hung on instead of sliding down the board face.
+      const out = new THREE.Vector3(0, 0, 1).applyQuaternion(t.curr.q).multiplyScalar(kick * (0.7 + Math.random() * 0.6));
+      t.body.setLinvel({ x: out.x, y: out.y + kick * 0.3, z: out.z }, true);
+      t.body.setAngvel({ x: (Math.random() - 0.5) * 12, y: (Math.random() - 0.5) * 12, z: (Math.random() - 0.5) * 12 }, true);
+    }
     t.body.wakeUp();
     t.asleep = false;
     for (const n of t.supported) this.unfreeze(n);
   }
 
+  /** Behind unbroken glass: nothing may move it yet. */
+  isHeld(t: DynamicThing) {
+    return !!physicsTag(t.obj)?.heldBy && !t.obj.userData.released;
+  }
+
+  /** Free everything `heldBy` this id, nudged along `push` (m/s, with some spread) so it leaves its shelf. */
+  release(id: string, push?: THREE.Vector3) {
+    const freed: DynamicThing[] = [];
+    for (const t of this.things) {
+      if (physicsTag(t.obj)?.heldBy !== id || t.obj.userData.released) continue;
+      t.obj.userData.released = true;
+      this.unfreeze(t);
+      freed.push(t);
+      // crowded shelves: settle instead of jostling neighbours for minutes
+      t.body.setLinearDamping(0.3);
+      t.body.setAngularDamping(1.2);
+      t.body.enableCcd(true); // thin frames dropping off shelves past glass shelves and shards
+      if (push) {
+        const k = 0.5 + Math.random();
+        t.body.setLinvel({ x: push.x * k, y: push.y * k - 0.2, z: push.z * k }, true);
+        t.body.setAngvel({ x: (Math.random() - 0.5) * 3, y: (Math.random() - 0.5) * 3, z: (Math.random() - 0.5) * 3 }, true);
+      }
+    }
+    return freed;
+  }
+
   resetThing(t: DynamicThing) {
     const b = t.body;
+    t.obj.userData.released = false;
     if (!t.frozen) {
       b.setBodyType(this.R.RigidBodyType.Fixed, false);
       t.frozen = true;
@@ -702,7 +737,8 @@ export class Physics {
   }
 
   thingForCollider(c: Collider | null | undefined) {
-    return c ? this.byCollider.get(c.handle) : undefined;
+    const t = c ? this.byCollider.get(c.handle) : undefined;
+    return t && !this.isHeld(t) ? t : undefined;
   }
 
   find(name: string) {
